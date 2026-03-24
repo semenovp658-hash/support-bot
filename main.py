@@ -2,7 +2,7 @@ import logging
 import sqlite3
 import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 # Enable logging
 logging.basicConfig(
@@ -151,7 +151,7 @@ async def get_reply_keyboard(chat_id, is_moderator=False):
     return InlineKeyboardMarkup(keyboard)
 
 # --- Command Handlers ---
-async def start(update: Update, context) -> None:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     welcome_text = (
         f"Привет, {user.mention_html()}! Я бот поддержки.\n\n"
@@ -170,7 +170,7 @@ async def start(update: Update, context) -> None:
     await update.message.reply_html(welcome_text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 # --- Message Handler ---
-async def handle_message(update: Update, context) -> None:
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
 
@@ -193,7 +193,9 @@ async def handle_message(update: Update, context) -> None:
             else:
                 await update.message.reply_text("❌ Диалог не активен.")
         else:
-            await update.message.reply_text("⚠️ У вас нет активного диалога. Нажмите «Ответить» в уведомлении о новом запросе.")
+            # Check if user is trying to start a chat as a user but they are a moderator
+            # To avoid confusion, moderators cannot send support requests to themselves
+            await update.message.reply_text("⚠️ Вы находитесь в режиме модератора. Чтобы ответить пользователю, сначала возьмите чат через кнопку «Ответить» в уведомлении.")
         return
 
     # User Logic
@@ -212,13 +214,18 @@ async def handle_message(update: Update, context) -> None:
                 text=f"👤 Сообщение от пользователя {user_id}:\n\n{text}",
                 reply_markup=await get_reply_keyboard(chat_id, is_moderator=True)
             )
-            await update.message.reply_text("✅ Сообщение доставлено модератору.")
+            await update.message.reply_text("✅ Сообщение доставлено модератору.", reply_markup=await get_reply_keyboard(chat_id, is_moderator=False))
         elif chat_info and chat_info['status'] == 'open':
             add_message_to_chat(chat_id, user_id, text)
             await update.message.reply_text("⏳ Ваш запрос уже в очереди. Модератор скоро ответит.")
+        else:
+            # Handle edge cases like status being 'open' but no chat_info found
+            new_chat_id = create_new_chat(user_id, text)
+            await update.message.reply_text("⏳ Ваш запрос отправлен модераторам. Ожидайте ответа.")
+            await notify_moderators(context.application, user_id, text, new_chat_id)
 
 # --- Callback Query Handler ---
-async def handle_callback(update: Update, context) -> None:
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     data = query.data
     user_id = query.from_user.id
@@ -230,18 +237,19 @@ async def handle_callback(update: Update, context) -> None:
         chat_info = get_chat_info(chat_id)
 
         if user_id not in MODERATOR_IDS:
+            await query.answer("Вы не модератор!", show_alert=True)
             return
 
         if chat_info and chat_info['status'] == 'open':
             if not get_moderator_current_chat(user_id):
                 update_chat_status(chat_id, 'in_progress', user_id)
-                await query.edit_message_text(f"🤝 Вы взяли чат #{chat_id}. Напишите ответ пользователю прямо сюда.")
+                await query.edit_message_text(f"🤝 Вы взяли чат #{chat_id}.\nПользователь ID: {chat_info['user_telegram_id']}\n\nНапишите ответ пользователю прямо сюда.")
                 await context.bot.send_message(
                     chat_id=chat_info['user_telegram_id'],
                     text="👨‍💻 Модератор подключился к диалогу. Можете задавать вопросы."
                 )
             else:
-                await query.edit_message_text("❌ У вас уже есть активный чат. Сначала завершите его.")
+                await query.answer("У вас уже есть активный чат!", show_alert=True)
         else:
             await query.edit_message_text("⚠️ Этот чат уже взят или закрыт.")
 
