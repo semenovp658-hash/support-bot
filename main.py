@@ -26,12 +26,20 @@ DB_NAME = 'bot_support.db'
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Stores current interaction state
+    # Stores current interaction state for users
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             user_id INTEGER PRIMARY KEY,
             moderator_id INTEGER,
             last_message_id INTEGER,
+            state TEXT
+        )
+    """)
+    # Stores current interaction state for moderators initiating a chat
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS moderator_states (
+            moderator_id INTEGER PRIMARY KEY,
+            target_user_id INTEGER,
             state TEXT
         )
     """)
@@ -71,6 +79,31 @@ def clear_session(user_id):
     conn.commit()
     conn.close()
 
+def set_moderator_state(moderator_id, target_user_id=None, state='idle'):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO moderator_states (moderator_id, target_user_id, state) VALUES (?, ?, ?)",
+                   (moderator_id, target_user_id, state))
+    conn.commit()
+    conn.close()
+
+def get_moderator_state(moderator_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT target_user_id, state FROM moderator_states WHERE moderator_id = ?", (moderator_id,))
+    result = cursor.fetchone()
+    conn.close()
+    if result:
+        return {'target_user_id': result[0], 'state': result[1]}
+    return None
+
+def clear_moderator_state(moderator_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM moderator_states WHERE moderator_id = ?", (moderator_id,))
+    conn.commit()
+    conn.close()
+
 # --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -96,6 +129,7 @@ async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         target_user_id = get_user_by_moderator(user_id)
         if target_user_id:
             clear_session(target_user_id)
+            clear_moderator_state(user_id) # Clear moderator state as well
             await update.message.reply_text(f"✅ Диалог с пользователем {target_user_id} завершен.")
             await context.bot.send_message(chat_id=target_user_id, text="🏁 Модератор завершил диалог.")
         else:
@@ -104,6 +138,25 @@ async def end_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         clear_session(user_id)
         await update.message.reply_text("✅ Ваш диалог завершен. Если у вас новый вопрос, просто напишите его.")
 
+async def send_to_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    moderator_id = update.effective_user.id
+    if moderator_id not in MODERATOR_IDS:
+        await update.message.reply_text("❌ Эта команда доступна только модераторам.")
+        return
+
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_text("Использование: /send_to_user <ID пользователя>\nПример: /send_to_user 123456789")
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Неверный ID пользователя. ID должен быть числом.")
+        return
+
+    set_moderator_state(moderator_id, target_user_id=target_user_id, state='awaiting_user_message')
+    await update.message.reply_text(f"📝 Введите сообщение для пользователя {target_user_id}. Оно будет отправлено ему.")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
@@ -111,17 +164,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     text = update.message.text
 
-    # 1. Moderator is replying to a specific user
+    # Check if moderator is in a state of sending a message to a specific user
+    if user_id in MODERATOR_IDS:
+        mod_state = get_moderator_state(user_id)
+        if mod_state and mod_state['state'] == 'awaiting_user_message':
+            target_user_id = mod_state['target_user_id']
+            try:
+                keyboard = [[InlineKeyboardButton("Ответить", callback_data=f"user_reply_{user_id}")]] # User replies to this moderator
+                await context.bot.send_message(
+                    chat_id=target_user_id,
+                    text=f"👨‍💻 Сообщение от модератора:\n\n{text}",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+                await update.message.reply_text(f"✅ Ваше сообщение отправлено пользователю {target_user_id}.")
+                clear_moderator_state(user_id) # Clear state after sending
+            except Exception as e:
+                await update.message.reply_text(f"❌ Ошибка при отправке сообщения пользователю {target_user_id}: {e}")
+            return
+
+    # 1. Moderator is replying to a specific user (from user-initiated chat)
     target_user_id = get_user_by_moderator(user_id)
     if target_user_id:
         try:
-            keyboard = [[InlineKeyboardButton("Ответить", callback_data=f"user_reply")]]
+            keyboard = [[InlineKeyboardButton("Ответить", callback_data=f"user_reply_{user_id}")]] # User replies to this moderator
             await context.bot.send_message(
                 chat_id=target_user_id,
                 text=f"👨‍💻 Ответ модератора:\n\n{text}",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
-            set_session(target_user_id, moderator_id=None, state='idle') # Reset state after reply
+            set_session(target_user_id, moderator_id=None, state='idle') # Reset user's session state after reply
             await update.message.reply_text("✅ Ваш ответ отправлен пользователю.")
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка при отправке: {e}")
@@ -137,11 +208,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     text=f"🆘 Сообщение от пользователя {user_id}:\n\n{text}",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
-            except:
+            except Exception as e:
+                logger.error(f"Error notifying moderator {mod_id}: {e}")
                 continue
         await update.message.reply_text("⏳ Ваше сообщение отправлено модераторам. Ожидайте ответа.")
     else:
-        await update.message.reply_text("⚠️ Чтобы ответить пользователю, нажмите кнопку «Ответить» под его сообщением.")
+        await update.message.reply_text("⚠️ Чтобы ответить пользователю, нажмите кнопку «Ответить» под его сообщением или используйте /send_to_user.")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -151,8 +223,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
     if data.startswith("mod_reply_"):
-        target_user_id = int(data.split("_")[2])
-        # Check if another moderator is already replying
+        target_user_id = int(data.split("_")[2]) # user_id from the original message
+        
+        # Check if another moderator is already replying to this user
         current_session = get_session(target_user_id)
         if current_session and current_session['state'] == 'replying' and current_session['moderator_id'] != user_id:
             await query.answer("⚠️ Другой модератор уже отвечает на это сообщение!", show_alert=True)
@@ -161,7 +234,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         set_session(target_user_id, moderator_id=user_id, state='replying')
         await query.edit_message_text(f"📝 Вы отвечаете пользователю {target_user_id}. Введите текст ответа:")
 
-    elif data == "user_reply":
+    elif data.startswith("user_reply_"):
+        moderator_to_reply_id = int(data.split("_")[2]) # moderator_id from the original message
+        set_session(user_id, moderator_id=moderator_to_reply_id, state='replying') # User is now replying to this specific moderator
         await query.edit_message_text("📝 Введите ваше сообщение для модератора:")
 
 def main() -> None:
@@ -170,6 +245,7 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("end", end_command))
+    application.add_handler(CommandHandler("send_to_user", send_to_user_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
